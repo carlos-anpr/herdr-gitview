@@ -18,6 +18,8 @@ Un plugin de [herdr](https://herdr.dev) que se abre sobre el panel donde trabaja
 
 ---
 
+![Grafo de commits con la explicación de IA del commit seleccionado](docs/screenshots/01-grafo-ia.png)
+
 ## ✨ Qué hace
 
 Cuando tienes varios agentes (Claude Code, Codex, OpenCode…) tocando repos a la vez, la pregunta es siempre la misma:
@@ -28,6 +30,8 @@ Cuando tienes varios agentes (Claude Code, Codex, OpenCode…) tocando repos a l
 | **1 · Grafo** | Todas las ramas con carriles de colores, ramas y tags, cambios sin commit, ficheros del commit y su diff |
 | **2 · Merge Requests** | MRs abiertos, fusionados, cerrados o todos, con ramas, pipeline, commits, ficheros y diff |
 | **3 · Ficheros** | Explorador con el estado git de cada fichero y su historial |
+
+![Diff de un fichero del commit, con números de línea y hunks](docs/screenshots/02-diff.png)
 
 - 🎯 **Abre el repo adecuado**: si el panel está en un repo, abre ese. Si está en una carpeta con muchos repos,
   propone los que un agente ha tocado hace poco: paneles de herdr, sesiones recientes de Claude Code y Codex,
