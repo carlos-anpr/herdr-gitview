@@ -332,7 +332,7 @@ fn herdr_panes() -> Vec<PaneInfo> {
 }
 
 /// Claude Code codifica la ruta del proyecto sustituyendo todo lo no alfanumérico por '-'.
-/// En Windows `C:\Users\UR\Documents` → `C--Users-UR-Documents`.
+/// En Windows `C:\Users\ana\Proyectos` → `C--Users-ana-Proyectos`.
 fn claude_encode(p: &Path) -> String {
     p.to_string_lossy()
         .chars()
@@ -538,12 +538,12 @@ mod tests {
     #[test]
     fn encode_like_claude_windows() {
         assert_eq!(
-            claude_encode(Path::new(r"C:\Users\UR\Documents")),
-            "C--Users-UR-Documents"
+            claude_encode(Path::new(r"C:\Users\ana\Proyectos")),
+            "C--Users-ana-Proyectos"
         );
         assert_eq!(
-            claude_encode(Path::new(r"C:\Users\UR\Documents\herdr-gitview")),
-            "C--Users-UR-Documents-herdr-gitview"
+            claude_encode(Path::new(r"C:\Users\ana\Proyectos\herdr-gitview")),
+            "C--Users-ana-Proyectos-herdr-gitview"
         );
     }
 
@@ -556,14 +556,14 @@ mod tests {
         let f = dir.join("s.jsonl");
         fs::write(
             &f,
-            r#"{"file_path":"C:\\Users\\UR\\Documents\\repo\\src\\a.rs"} {"cwd":"C:/Users/UR/Documents/OTRO"} cd C:\Users\UR\Documents\suelto"#,
+            r#"{"file_path":"C:\\Users\\ana\\Proyectos\\repo\\src\\a.rs"} {"cwd":"C:/Users/ana/Proyectos/OTRO"} cd C:\Users\ana\Proyectos\suelto"#,
         )
         .unwrap();
         let repos = vec![
-            PathBuf::from(r"C:\Users\UR\Documents\repo"),
-            PathBuf::from(r"C:\Users\UR\Documents\otro"),
+            PathBuf::from(r"C:\Users\ana\Proyectos\repo"),
+            PathBuf::from(r"C:\Users\ana\Proyectos\otro"),
         ];
-        let got = repos_in_file(&f, r"C:\Users\UR\Documents", &repos);
+        let got = repos_in_file(&f, r"C:\Users\ana\Proyectos", &repos);
         assert_eq!(got, vec![0, 1]);
         fs::remove_dir_all(&dir).ok();
     }

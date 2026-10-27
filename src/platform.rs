@@ -175,11 +175,11 @@ mod tests {
 
     #[test]
     fn strip_verbatim_quita_prefijo() {
-        let p = strip_verbatim(PathBuf::from(r"\\?\C:\Users\UR\Documents"));
+        let p = strip_verbatim(PathBuf::from(r"\\?\C:\Users\ana\Proyectos"));
         if cfg!(windows) {
-            assert_eq!(p, PathBuf::from(r"C:\Users\UR\Documents"));
+            assert_eq!(p, PathBuf::from(r"C:\Users\ana\Proyectos"));
         } else {
-            assert_eq!(p, PathBuf::from(r"\\?\C:\Users\UR\Documents"));
+            assert_eq!(p, PathBuf::from(r"\\?\C:\Users\ana\Proyectos"));
         }
     }
 

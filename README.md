@@ -55,7 +55,20 @@ Cuando tienes varios agentes (Claude Code, Codex, OpenCode…) tocando repos a l
 - Para la IA: `curl` (en Windows 10/11 ya viene `curl.exe`) y una clave de [Ollama Cloud](https://ollama.com/settings/keys)
   en `OLLAMA_API_KEY`, o cualquier otra API compatible con OpenAI o CLI de agente (ver abajo).
 
+> 🔐 No lleva ninguna cuenta, URL ni clave dentro. El proyecto de GitHub o GitLab se saca del remoto `origin` de
+> cada repo y se consulta con la sesión de `gh`/`glab` de quien lo usa. La IA usa la clave de su propia variable de
+> entorno y el endpoint o modelo que configure.
+
 ## 🚀 Instalación
+
+El mismo repositorio y los mismos comandos sirven en Windows, Linux y macOS: herdr elige solo el panel de cada
+plataforma y `cargo` compila el binario nativo.
+
+```sh
+herdr plugin install carlos-anpr/herdr-gitview   # clona y compila (requiere cargo)
+```
+
+O desde una copia local:
 
 ```sh
 git clone https://github.com/carlos-anpr/herdr-gitview.git
