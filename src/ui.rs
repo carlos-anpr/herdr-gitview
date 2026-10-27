@@ -69,7 +69,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_footer(f, app, foot);
     }
     if app.help {
-        draw_help(f, area);
+        draw_help(f, app, area);
     }
 }
 
@@ -96,11 +96,12 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         dim(format!("  {host}")),
     ];
     let narrow = area.width < 120;
-    let tabs = [
-        (Tab::Graph, " 1 Grafo "),
-        (Tab::Mrs, if narrow { " 2 MRs " } else { " 2 Merge Requests " }),
-        (Tab::Files, " 3 Ficheros "),
-    ];
+    let mr_tab = if narrow { format!(" 2 {}s ", r.forge_hint().short()) } else { format!(" 2 {} ", r.forge_hint().label()) };
+    let mut tabs = vec![(Tab::Graph, " 1 Grafo ")];
+    if r.forge.flatten().is_some() {
+        tabs.push((Tab::Mrs, mr_tab.as_str()));
+    }
+    tabs.push((Tab::Files, " 3 Ficheros "));
     let btns = [
         (Btn::Reveal, if narrow { " ▤ " } else { " ▤ ubicación " }),
         (Btn::Back, if narrow { " ⌂ " } else { " ⌂ proyectos " }),
@@ -160,7 +161,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         match app.tab {
             Tab::Graph => &[("↑↓", "mover"), ("⏎", "abrir"), ("⇥", "panel"), ("e", "explicar IA"), ("O", "ubicación"), ("y", "copiar sha"), ("p", "proyectos"), ("?", "ayuda")],
-            Tab::Mrs => &[("↑↓", "mover"), ("⏎", "ficheros"), ("e", "explicar MR"), ("a", "estado"), ("o", "abrir web"), ("O", "ubicación"), ("?", "ayuda")],
+            Tab::Mrs => &[("↑↓", "mover"), ("⏎", "ficheros"), ("e", if app.repo.as_ref().is_some_and(|r| r.forge_hint().short() == "PR") { "explicar PR" } else { "explicar MR" }), ("a", "estado"), ("o", "abrir web"), ("O", "ubicación"), ("?", "ayuda")],
             Tab::Files => &[("↑↓", "mover"), ("⏎", "entrar"), ("⌫", "subir"), ("e", "explicar"), ("o", "abrir repo"), ("O", "ubicación"), ("?", "ayuda")],
         }
     };
@@ -594,8 +595,9 @@ fn draw_mrs(f: &mut Frame, app: &mut App, area: Rect) {
     let (left, right) = split_lr(app, area);
     let focused = app.focus == Pane::Left;
     let r = app.repo.as_ref().unwrap();
-    let mut title = vec![bold(" Merge Requests "), dim(format!("{} ", r.mrs.len()))];
-    if r.mr_loading || r.gitlab.is_none() {
+    let forge = r.forge_hint();
+    let mut title = vec![bold(format!(" {} ", forge.label())), dim(format!("{} ", r.mrs.len()))];
+    if r.mr_loading || r.forge.is_none() {
         title.push(fg(format!("{} ", spin(app)), ACCENT));
     }
     let block = panel(title, focused);
@@ -630,20 +632,20 @@ fn draw_mrs(f: &mut Frame, app: &mut App, area: Rect) {
     let w = list.width as usize;
     let now = now();
     let mut lines = Vec::new();
-    match r.gitlab {
-        None => lines.push(Line::from(dim(format!(" {} comprobando GitLab…", spin(app))))),
-        Some(false) => {
-            lines.push(Line::from(fg(" Este repositorio no apunta a un GitLab con glab autenticado.", WARN)));
-            lines.push(Line::from(dim(" Comprueba `glab auth status` y el remoto `origin`.")));
+    match r.forge {
+        None => lines.push(Line::from(dim(format!(" {} comprobando {}...", spin(app), forge.name())))),
+        Some(None) => {
+            lines.push(Line::from(fg(format!(" Este repositorio no apunta a un {} con {} autenticado.", forge.name(), forge.cli()), WARN)));
+            lines.push(Line::from(dim(format!(" Comprueba `{} auth status` y el remoto `origin`.", forge.cli()))));
         }
-        Some(true) => {
+        Some(Some(forge)) => {
             if let Some(e) = &r.mr_err {
                 for l in wrap(e, w.saturating_sub(2)) {
                     lines.push(Line::from(fg(format!(" {l}"), DEL)));
                 }
             }
             for (i, mr) in r.mrs.iter().enumerate().skip(off).take(h) {
-                let id = format!("!{:<5}", mr.iid);
+                let id = format!("{}{:<5}", forge.id_prefix(), mr.iid);
                 let right = if w >= 80 { format!(" {} {}", pad(&mr.author, 14), pad_left(&fmt_short(mr.updated_at, now), 7)) } else { String::new() };
                 let tw = w.saturating_sub(width(&id) + 3 + width(&right));
                 let title = if mr.draft { format!("Draft: {}", mr.title) } else { mr.title.clone() };
@@ -657,7 +659,7 @@ fn draw_mrs(f: &mut Frame, app: &mut App, area: Rect) {
                 lines.push(row(spans, w, i == sel, focused));
             }
             if r.mrs.is_empty() && !r.mr_loading && r.mr_err.is_none() {
-                lines.push(Line::from(dim(" No hay MRs en este estado.")));
+                lines.push(Line::from(dim(format!(" No hay {}s en este estado.", forge.short()))));
             }
         }
     }
@@ -686,13 +688,14 @@ fn draw_mr_detail(f: &mut Frame, app: &mut App, area: Rect, compact: bool) {
     let focused = app.focus == Pane::Right && !compact;
     let w = area.width.saturating_sub(2) as usize;
     let Some(mr) = app.sel_mr().cloned() else {
-        f.render_widget(Paragraph::new(dim(" Selecciona un Merge Request")), area);
+        let label = app.repo.as_ref().map_or("solicitud", |r| r.forge_hint().short());
+        f.render_widget(Paragraph::new(dim(format!(" Selecciona un {label}"))), area);
         return;
     };
     let r = app.repo.as_ref().unwrap();
     let mut info: Vec<Line> = Vec::new();
     for (i, l) in wrap(&mr.title, w).into_iter().enumerate() {
-        let pre = if i == 0 { format!(" !{} ", mr.iid) } else { "  ".into() };
+        let pre = if i == 0 { format!(" {}{} ", r.forge_hint().id_prefix(), mr.iid) } else { "  ".into() };
         info.push(Line::from(vec![fg(pre, ACCENT), Span::styled(l, Style::new().fg(Color::White).add_modifier(Modifier::BOLD))]));
     }
     let mut meta = vec![Span::raw(" "), mr_badge(&mr.state), Span::raw(format!("{}  ", mr.state)), bold(mr.author.clone())];
@@ -734,8 +737,8 @@ fn draw_mr_detail(f: &mut Frame, app: &mut App, area: Rect, compact: bool) {
     let info_h = if compact { 0 } else { (info.len() as u16 + 1).min(area.height / 2).max(4) };
     let [top, bottom] = Layout::vertical([Constraint::Length(info_h), Constraint::Min(3)]).areas(area);
     f.render_widget(Paragraph::new(info), top);
-    let label = " ↗ GitLab (o) ";
-    let lw = width(label) as u16;
+    let label = format!(" {} (o) ", r.forge_hint().name());
+    let lw = width(&label) as u16;
     if web_row < top.height && top.width > lw + 40 {
         let b = Rect::new(top.x + top.width - lw - 1, top.y + web_row, lw, 1);
         f.render_widget(Paragraph::new(Span::styled(label, Style::new().fg(ACCENT).bg(SEL_BG_DIM))), b);
@@ -983,24 +986,35 @@ fn draw_picker(f: &mut Frame, app: &mut App, area: Rect) {
 
 // ──────────────────────────────── ayuda ────────────────────────────────
 
-fn draw_help(f: &mut Frame, area: Rect) {
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+    let forge = app.repo.as_ref().map(|r| r.forge_hint());
+    let short = forge.map_or("PR/MR", |f| f.short());
+    let tabs_help = if let Some(forge) = forge.filter(|_| app.repo.as_ref().is_some_and(|r| r.forge.flatten().is_some())) {
+        format!("Grafo / {} / Ficheros (o clic en la pestaña)", forge.label())
+    } else {
+        "Grafo / Ficheros (o clic en la pestaña)".into()
+    };
+    let explain_help = format!("explicar con IA (commit, fichero o {short})");
+    let state_help = format!("{short}s: cambiar filtro de estado");
+    let open_help = format!("{short}s: abrir en navegador / Ficheros: abrir repo");
+    let copy_help = format!("copiar SHA (o URL del {short}) al portapapeles");
     let keys: &[(&str, &str)] = &[
-        ("1 / 2 / 3", "Grafo · Merge Requests · Ficheros (o clic en la pestaña)"),
+        ("1 / 2 / 3", &tabs_help),
         ("↑↓ j k · rueda", "mover / desplazar"),
         ("PgUp PgDn · g G", "página · inicio / fin"),
         ("⏎ · → · l · doble clic", "abrir (commit → ficheros → diff)"),
         ("⇥", "cambiar de panel"),
         ("esc · ← · ⌫", "volver / cerrar diff / subir carpeta"),
-        ("e", "explicar con IA (commit, fichero o MR según el foco)"),
+        ("e", &explain_help),
         ("E", "regenerar la explicación (ignora caché)"),
         ("J / K · rueda", "desplazar la explicación"),
         ("z", "ampliar / reducir la caja de IA"),
         ("n / N", "siguiente / anterior hunk en el diff"),
         ("[ / ]", "fichero anterior / siguiente con el diff abierto"),
-        ("a", "MRs: cambiar filtro de estado"),
-        ("o", "MRs: abrir en el navegador · Ficheros: abrir repo"),
+        ("a", &state_help),
+        ("o", &open_help),
         ("O · Ctrl+O", "abrir la ubicación real en el gestor de archivos"),
-        ("y", "copiar SHA (o URL del MR) al portapapeles"),
+        ("y", &copy_help),
         ("p", "volver al selector de proyectos"),
         ("r", "recargar"),
         ("q · esc", "salir"),
@@ -1017,4 +1031,43 @@ fn draw_help(f: &mut Frame, area: Rect) {
         .map(|(k, d)| Line::from(vec![Span::styled(format!(" {}", pad(k, 24)), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)), Span::raw(*d)]))
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config, forge::Forge};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn render(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(160, 45)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().buffer().content().iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn forge_labels_identifiers_help_and_hidden_tab_render_without_terminal() {
+        let mut app = App::new(Config::default());
+        app.repo = Some(test_repo(Some(Forge::GitHub)));
+        app.tab = Tab::Mrs;
+        let screen = render(&mut app);
+        assert!(screen.contains("2 Pull Requests"));
+        assert!(screen.contains("#12"));
+        assert!(screen.contains("GitHub (o)"));
+        assert!(!screen.contains("Merge Requests"));
+        app.help = true;
+        assert!(render(&mut app).contains("PRs: cambiar filtro"));
+        app.help = false;
+        app.repo.as_mut().unwrap().forge = Some(Some(Forge::GitLab));
+        let screen = render(&mut app);
+        assert!(screen.contains("2 Merge Requests"));
+        assert!(screen.contains("!12"));
+        assert!(screen.contains("GitLab (o)"));
+        app.repo.as_mut().unwrap().forge = Some(None);
+        app.tab = Tab::Graph;
+        let screen = render(&mut app);
+        assert!(!screen.contains("2 Pull Requests"));
+        assert!(!screen.contains("2 Merge Requests"));
+        assert!(!app.hits.iter().any(|(_, hit)| matches!(hit, Hit::Tab(Tab::Mrs))));
+    }
 }

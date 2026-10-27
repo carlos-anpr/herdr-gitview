@@ -5,11 +5,15 @@ mod diff;
 mod discover;
 #[allow(dead_code)] // API completa del contrato; no todo lo usa la UI
 mod git;
+mod forge;
+mod github;
 #[allow(dead_code)] // API completa del contrato; no todo lo usa la UI
 mod gitlab;
 mod graph;
+mod herdr_open;
 #[allow(dead_code)] // API completa del contrato; no todo lo usa la UI
 mod model;
+mod platform;
 mod text;
 mod ui;
 
@@ -22,7 +26,7 @@ use std::time::Duration;
 
 const USAGE: &str = "herdr-gitview [RUTA] [--pick] [--discover]
 
-Visor de commits, ramas y Merge Requests de GitLab con explicaciones de IA.
+Visor de commits, ramas, Pull Requests de GitHub y Merge Requests de GitLab con explicaciones de IA.
   RUTA         carpeta de partida (por defecto: cwd del panel activo de herdr o el cwd)
   --pick       mostrar siempre el selector de proyectos
   --discover   imprimir los candidatos detectados y salir (diagnóstico)";
@@ -32,6 +36,7 @@ fn main() -> anyhow::Result<()> {
     let (mut pick, mut print) = (false, false);
     for a in std::env::args().skip(1) {
         match a.as_str() {
+            "--herdr-open" => std::process::exit(herdr_open::run()?),
             "--pick" => pick = true,
             "--discover" => print = true,
             "-h" | "--help" => {
@@ -52,6 +57,7 @@ fn main() -> anyhow::Result<()> {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
     let start = start.canonicalize().unwrap_or(start);
+    let start = platform::strip_verbatim(start);
 
     let found = if pick {
         let base = git::repo_root(&start).and_then(|r| r.parent().map(PathBuf::from)).unwrap_or(start.clone());

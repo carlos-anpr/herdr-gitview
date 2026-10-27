@@ -4,14 +4,14 @@
 use crate::model::*;
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const FIELD: char = '\x1f';
 const RECORD: char = '\x1e';
 const LOG_FORMAT: &str = "%H%x1f%h%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1e";
 
 fn git_output(repo: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
+    crate::platform::cmd("git")
         .arg("-C")
         .arg(repo)
         .arg("--no-pager")

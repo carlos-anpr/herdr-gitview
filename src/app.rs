@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::diff::DiffView;
 use crate::model::*;
-use crate::{ai, git, gitlab, graph};
+use crate::{ai, git, forge::{self, Forge}, graph};
 use ratatui::crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -169,8 +169,9 @@ pub enum Msg {
     Files { sha: String, res: Result<Vec<FileChange>, String> },
     Detail { sha: String, res: Result<CommitDetail, String> },
     Diff { tab: Tab, key: String, title: String, res: Result<String, String> },
-    Gitlab(bool),
+    Forge(Option<Forge>),
     Mrs { generation: u64, page: u32, res: Result<Vec<MergeRequest>, String> },
+    MrDetail { generation: u64, res: Result<MergeRequest, String> },
     MrDiffs { iid: u64, res: Result<Vec<MrFileDiff>, String> },
     MrCommits { iid: u64, res: Result<Vec<MrCommit>, String> },
     FileLog { path: String, res: Result<Vec<Commit>, String> },
@@ -201,7 +202,7 @@ pub struct Repo {
     /// SHA a reseleccionar tras una recarga.
     pub keep_sha: Option<String>,
     // MRs
-    pub gitlab: Option<bool>,
+    pub forge: Option<Option<Forge>>,
     pub mrs: Vec<MergeRequest>,
     pub mr_state: MrState,
     pub mr_page: u32,
@@ -221,6 +222,18 @@ pub struct Repo {
     pub fs_hist_nav: Nav,
     pub fs_hist: HashMap<String, Result<Vec<Commit>, String>>,
     pub fs_diff: Option<DiffView>,
+}
+
+impl Repo {
+    pub fn forge_hint(&self) -> Forge {
+        self.forge.flatten().unwrap_or_else(|| {
+            if self.remote.as_deref().is_some_and(|url| url.contains("github")) {
+                Forge::GitHub
+            } else {
+                Forge::GitLab
+            }
+        })
+    }
 }
 
 pub struct Picker {
@@ -346,7 +359,7 @@ impl App {
             details: HashMap::new(),
             g_diff: None,
             keep_sha: None,
-            gitlab: None,
+            forge: None,
             mrs: Vec::new(),
             mr_state: MrState::All,
             mr_page: 0,
@@ -378,7 +391,7 @@ impl App {
         self.reload_status();
         self.read_dir();
         let root = self.repo.as_ref().unwrap().root.clone();
-        self.spawn(move || Msg::Gitlab(gitlab::is_gitlab(&root)));
+        self.spawn(move || Msg::Forge(forge::detect(&root)));
         self.sel_changed = Some(Instant::now());
     }
 
@@ -412,9 +425,7 @@ impl App {
 
     fn reload_mrs(&mut self) {
         let Some(r) = self.repo.as_mut() else { return };
-        if r.gitlab != Some(true) {
-            return;
-        }
+        let Some(forge) = r.forge.flatten() else { return; };
         r.mr_gen += 1;
         r.mr_page = 1;
         r.mrs.clear();
@@ -423,18 +434,19 @@ impl App {
         r.mr_loading = true;
         r.mr_nav = Nav { follow: true, ..Default::default() };
         let (root, generation, st) = (r.root.clone(), r.mr_gen, r.mr_state);
-        self.spawn(move || Msg::Mrs { generation, page: 1, res: gitlab::list_mrs(&root, st, 1).map_err(|e| format!("{e:#}")) });
+        self.spawn(move || Msg::Mrs { generation, page: 1, res: forge.list_mrs(&root, st, 1).map_err(|e| format!("{e:#}")) });
     }
 
     fn more_mrs(&mut self) {
         let Some(r) = self.repo.as_mut() else { return };
-        if r.mr_loading || r.mr_done || r.gitlab != Some(true) {
+        if r.mr_loading || r.mr_done || r.forge.flatten().is_none() {
             return;
         }
+        let Some(forge) = r.forge.flatten() else { return; };
         r.mr_loading = true;
         r.mr_page += 1;
         let (root, generation, st, page) = (r.root.clone(), r.mr_gen, r.mr_state, r.mr_page);
-        self.spawn(move || Msg::Mrs { generation, page, res: gitlab::list_mrs(&root, st, page).map_err(|e| format!("{e:#}")) });
+        self.spawn(move || Msg::Mrs { generation, page, res: forge.list_mrs(&root, st, page).map_err(|e| format!("{e:#}")) });
     }
 
     pub fn read_dir(&mut self) {
@@ -658,6 +670,8 @@ impl App {
                 })
             }
             Tab::Mrs => {
+                let forge = r.forge.flatten()?;
+                let (short, prefix) = (forge.short(), forge.id_prefix());
                 let mr = self.sel_mr()?;
                 let remote = r.remote.clone().unwrap_or_default();
                 let ver = mr.sha.clone().unwrap_or_else(|| mr.updated_at.to_string());
@@ -668,9 +682,9 @@ impl App {
                     return Some(AiJob {
                         key: format!("mrfile:{remote}:{}:{ver}:{}", mr.iid, f.new_path),
                         kind: AiKind::File,
-                        label: format!("fichero {} (!{})", f.new_path, mr.iid),
+                        label: format!("fichero {} ({prefix}{})", f.new_path, mr.iid),
                         title: f.new_path.clone(),
-                        context: format!("MR !{} — {}\n{} → {}\n{}", mr.iid, mr.title, mr.source_branch, mr.target_branch, clip(&mr.description, 1500)),
+                        context: format!("{short} {prefix}{} — {}\n{} → {}\n{}", mr.iid, mr.title, mr.source_branch, mr.target_branch, clip(&mr.description, 1500)),
                         src: Src::Text(format!("--- a/{}\n+++ b/{}\n{}", f.old_path, f.new_path, f.diff)),
                     });
                 }
@@ -682,10 +696,10 @@ impl App {
                 Some(AiJob {
                     key: format!("mr:{remote}:{}:{ver}", mr.iid),
                     kind: AiKind::MergeRequest,
-                    label: format!("MR !{}", mr.iid),
+                    label: format!("{short} {prefix}{}", mr.iid),
                     title: mr.title.clone(),
                     context: format!(
-                        "MR !{} ({})\nAutor: {}\nRamas: {} → {}\nDescripción:\n{}\nCommits:\n{commits}",
+                        "{short} {prefix}{} ({})\nAutor: {}\nRamas: {} → {}\nDescripción:\n{}\nCommits:\n{commits}",
                         mr.iid,
                         mr.state,
                         mr.author,
@@ -752,6 +766,7 @@ impl App {
         let Some(root) = self.repo.as_ref().map(|r| r.root.clone()) else { return };
         self.ai.insert(job.key.clone(), AiState::Running(Instant::now(), String::new()));
         self.ai_nav = Nav::default();
+        let forge = self.repo.as_ref().and_then(|r| r.forge.flatten());
         let cfg = self.cfg.clone();
         let max = cfg.ai_max_diff_bytes;
         let tx = self.tx.clone();
@@ -761,7 +776,7 @@ impl App {
                 Src::CommitFile(sha, p) => git::file_diff(&root, sha, p).map_err(|e| format!("{e:#}")),
                 Src::Working(p) => working_both(&root, p),
                 Src::WorkingAll => git_out(&root, &["diff", "HEAD", "-M"]),
-                Src::Mr(iid) => gitlab::mr_diffs(&root, *iid).map_err(|e| format!("{e:#}")).map(|v| {
+                Src::Mr(iid) => forge.ok_or_else(|| "forja no disponible".to_owned()).and_then(|forge| forge.mr_diffs(&root, *iid).map_err(|e| format!("{e:#}"))).map(|v| {
                     v.iter().map(|f| format!("--- a/{}\n+++ b/{}\n{}", f.old_path, f.new_path, f.diff)).collect::<Vec<_>>().join("\n")
                 }),
                 Src::Text(t) => Ok(t.clone()),
@@ -819,7 +834,7 @@ impl App {
                 }
             }
             Tab::Mrs => {
-                if r.gitlab == Some(true) && r.mrs.is_empty() && !r.mr_loading && r.mr_err.is_none() && !r.mr_done {
+                if r.forge.flatten().is_some() && r.mrs.is_empty() && !r.mr_loading && r.mr_err.is_none() && !r.mr_done {
                     self.reload_mrs();
                     return;
                 }
@@ -828,12 +843,19 @@ impl App {
                 }
                 let Some(iid) = self.sel_mr().map(|m| m.iid) else { return };
                 let r = self.repo.as_ref().unwrap();
+                let Some(forge) = r.forge.flatten() else { return; };
                 if !r.mr_diffs.contains_key(&iid) && self.inflight.insert(format!("mrdiffs:{iid}")) {
                     let root2 = root.clone();
-                    self.spawn(move || Msg::MrDiffs { iid, res: gitlab::mr_diffs(&root2, iid).map_err(|e| format!("{e:#}")) });
+                    let tx = self.tx.clone();
+                    let (epoch, generation) = (self.epoch, r.mr_gen);
+                    self.spawn(move || {
+                        let res = forge.get_mr(&root2, iid).map_err(|e| format!("{e:#}"));
+                        let _ = tx.send((epoch, Msg::MrDetail { generation, res }));
+                        Msg::MrDiffs { iid, res: forge.mr_diffs(&root2, iid).map_err(|e| format!("{e:#}")) }
+                    });
                 }
                 if !r.mr_commits.contains_key(&iid) && self.inflight.insert(format!("mrcommits:{iid}")) {
-                    self.spawn(move || Msg::MrCommits { iid, res: gitlab::mr_commits(&root, iid).map_err(|e| format!("{e:#}")) });
+                    self.spawn(move || Msg::MrCommits { iid, res: forge.mr_commits(&root, iid).map_err(|e| format!("{e:#}")) });
                 }
             }
             Tab::Files => {
@@ -954,9 +976,9 @@ impl App {
                     Tab::Files => r.fs_diff = Some(view),
                 }
             }
-            Msg::Gitlab(ok) => {
-                r.gitlab = Some(ok);
-                if ok && self.tab == Tab::Mrs {
+            Msg::Forge(forge) => {
+                r.forge = Some(forge);
+                if forge.is_some() && self.tab == Tab::Mrs {
                     self.reload_mrs();
                 }
             }
@@ -982,6 +1004,12 @@ impl App {
                 }
                 self.sel_changed.get_or_insert_with(Instant::now);
             }
+            Msg::MrDetail { generation, res } => {
+                if generation == r.mr_gen && let Ok(detail) = res
+                    && let Some(mr) = r.mrs.iter_mut().find(|mr| mr.iid == detail.iid) {
+                    *mr = detail;
+                }
+            }
             Msg::MrDiffs { iid, res } => {
                 self.inflight.remove(&format!("mrdiffs:{iid}"));
                 r.mr_diffs.insert(iid, res);
@@ -1000,6 +1028,9 @@ impl App {
     // ────────────────────────────── acciones ──────────────────────────────
 
     fn set_tab(&mut self, t: Tab) {
+        if t == Tab::Mrs && self.repo.as_ref().and_then(|r| r.forge.flatten()).is_none() {
+            return;
+        }
         if self.repo.is_none() {
             return;
         }
@@ -1009,7 +1040,7 @@ impl App {
         self.sel_changed = Some(Instant::now());
         if t == Tab::Mrs {
             let r = self.repo.as_ref().unwrap();
-            if r.gitlab == Some(true) && r.mrs.is_empty() && !r.mr_loading && r.mr_err.is_none() {
+            if r.forge.flatten().is_some() && r.mrs.is_empty() && !r.mr_loading && r.mr_err.is_none() {
                 self.reload_mrs();
             }
         }
@@ -1098,7 +1129,7 @@ impl App {
                 let Some(mr) = self.sel_mr() else { return };
                 let Some(Ok(diffs)) = r.mr_diffs.get(&mr.iid) else { return };
                 let Some(f) = diffs.get(r.mr_files_nav.sel) else { return };
-                let title = format!("{}  (!{})", f.new_path, mr.iid);
+                let title = format!("{}  ({}{})", f.new_path, r.forge.flatten().map_or("", Forge::id_prefix), mr.iid);
                 let text = format!("--- a/{}\n+++ b/{}\n{}", f.old_path, f.new_path, f.diff);
                 if let Some(r) = self.repo.as_mut() {
                     r.mr_diff = Some(DiffView::new(title, &text));
@@ -1184,11 +1215,7 @@ impl App {
 
     fn open_web(&mut self) {
         if let Some(url) = self.sel_mr().map(|m| m.web_url.clone()) {
-            let _ = std::process::Command::new("xdg-open")
-                .arg(&url)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+            crate::platform::open_url(&url);
             self.toast(format!("Abriendo {url}"));
         }
     }
@@ -1450,7 +1477,8 @@ impl App {
             KeyCode::BackTab => self.set_tab(match self.tab {
                 Tab::Graph => Tab::Files,
                 Tab::Mrs => Tab::Graph,
-                Tab::Files => Tab::Mrs,
+                Tab::Files if self.repo.as_ref().and_then(|r| r.forge.flatten()).is_some() => Tab::Mrs,
+                Tab::Files => Tab::Graph,
             }),
             KeyCode::Up | KeyCode::Char('k') => self.move_sel(id, -1),
             KeyCode::Down | KeyCode::Char('j') => self.move_sel(id, 1),
@@ -1613,33 +1641,14 @@ fn clip(s: &str, n: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// FileManager1.ShowItems (Nautilus, Dolphin, Nemo… seleccionan el elemento); si falla, xdg-open.
+/// Muestra el fichero o directorio en el gestor de ficheros del sistema (ver `platform::reveal`).
 fn reveal_path(path: &Path) {
-    use std::process::{Command, Stdio};
-    let uri = format!("file://{}", uri_encode(&path.to_string_lossy()));
-    let shown = Command::new("dbus-send")
-        .args([
-            "--session",
-            "--print-reply",
-            "--dest=org.freedesktop.FileManager1",
-            "--type=method_call",
-            "/org/freedesktop/FileManager1",
-            "org.freedesktop.FileManager1.ShowItems",
-            &format!("array:string:{uri}"),
-            "string:",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !shown {
-        let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        let _ = Command::new("xdg-open").arg(dir).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    }
+    crate::platform::reveal(path);
 }
 
-/// Codifica una ruta para una URI file:// (respeta '/').
-fn uri_encode(s: &str) -> String {
+/// Codifica una ruta para una URI file:// (respeta '/'). La usa `platform::reveal` en Linux.
+#[cfg_attr(windows, allow(dead_code))] // en Windows `reveal` usa explorer y nadie la llama
+pub(crate) fn uri_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"/-_.~".contains(&b) {
@@ -1699,6 +1708,27 @@ fn base64(b: &[u8]) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn test_repo(forge: Option<Forge>) -> Repo {
+    Repo {
+        root: PathBuf::from("test-repo"), name: "test-repo".into(), branch: "main".into(),
+        remote: Some("https://github.com/owner/repo.git".into()),
+        commits: vec![], rows: vec![], log_gen: 0, log_loading: false, log_done: true,
+        log_err: None, status: vec![], status_map: HashMap::new(),
+        g_nav: Nav::default(), g_files_nav: Nav::default(), files: HashMap::new(),
+        details: HashMap::new(), g_diff: None, keep_sha: None,
+        forge: Some(forge), mrs: vec![MergeRequest {
+            iid: 12, title: "Example change".into(), state: "opened".into(),
+            sha: Some("abc123".into()), ..Default::default()
+        }], mr_state: MrState::All, mr_page: 1, mr_loading: false,
+        mr_done: true, mr_err: None, mr_gen: 0,
+        mr_nav: Nav::default(), mr_files_nav: Nav::default(), mr_diffs: HashMap::new(),
+        mr_commits: HashMap::new(), mr_diff: None,
+        fs_dir: PathBuf::from("test-repo"), fs_entries: vec![],
+        fs_nav: Nav::default(), fs_hist_nav: Nav::default(), fs_hist: HashMap::new(), fs_diff: None,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1723,4 +1753,35 @@ mod tests {
         n.fit(10, 100);
         assert_eq!(n.off, 16);
     }
+    #[test]
+    fn ai_request_uses_forge_terms_and_project_cache_identity() {
+        for (forge, id) in [(Forge::GitHub, "PR #12"), (Forge::GitLab, "MR !12")] {
+            let mut app = App::new(Config::default());
+            app.repo = Some(test_repo(Some(forge)));
+            app.tab = Tab::Mrs;
+            let job = app.ai_job().unwrap();
+            assert_eq!(job.label, id);
+            assert!(job.context.starts_with(id));
+            assert_eq!(job.key, "mr:https://github.com/owner/repo.git:12:abc123");
+            app.repo.as_mut().unwrap().mr_diffs.insert(12, Ok(vec![MrFileDiff {
+                new_path: "x.rs".into(), ..Default::default()
+            }]));
+            app.focus = Pane::Right;
+            let job = app.ai_job().unwrap();
+            assert!(job.context.starts_with(id));
+            assert!(job.label.contains(&id[3..]));
+        }
+    }
+
+    #[test]
+    fn unavailable_forge_cannot_be_selected_and_is_skipped_by_backtab() {
+        let mut app = App::new(Config::default());
+        app.repo = Some(test_repo(None));
+        app.set_tab(Tab::Mrs);
+        assert_eq!(app.tab, Tab::Graph);
+        app.tab = Tab::Files;
+        app.on_event(Event::Key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)));
+        assert_eq!(app.tab, Tab::Graph);
+    }
+
 }

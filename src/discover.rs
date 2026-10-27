@@ -2,11 +2,12 @@
 
 use crate::config::Config;
 use crate::model::Candidate;
+use crate::platform;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SKIP_DIRS: &[&str] = &[
@@ -236,10 +237,15 @@ fn par_map<T: Sync, R: Send + Clone>(items: &[T], f: impl Fn(&T) -> R + Sync, fa
 
 /// Índice del candidato que contiene `p` (el más profundo).
 fn owner(cands: &[Candidate], p: &Path) -> Option<usize> {
+    let p_norm = norm_path(&p.to_string_lossy());
     cands
         .iter()
         .enumerate()
-        .filter(|(_, c)| p.starts_with(&c.path))
+        .filter(|(_, c)| {
+            let repo = norm_path(&c.path.to_string_lossy());
+            p_norm == repo
+                || (p_norm.starts_with(&repo) && matches!(p_norm.as_bytes().get(repo.len()), Some(b'\\')))
+        })
         .max_by_key(|(_, c)| c.path.as_os_str().len())
         .map(|(i, _)| i)
 }
@@ -264,7 +270,7 @@ fn git_signals(repo: &Path) -> (Option<String>, usize, Option<i64>) {
         })
     });
     let head_t = gitdir.as_ref().and_then(|g| mtime(&g.join("logs/HEAD")));
-    let dirty = Command::new("git")
+    let dirty = platform::cmd("git")
         .args(["-C"])
         .arg(repo)
         .args(["status", "--porcelain=v1", "-uno"])
@@ -298,7 +304,7 @@ struct PaneInfo {
 
 fn herdr_panes() -> Vec<PaneInfo> {
     let bin = env_nonempty("HERDR_BIN_PATH").unwrap_or_else(|| "herdr".into());
-    let Ok(out) = Command::new(bin).args(["pane", "list"]).output() else { return vec![] };
+    let Ok(out) = platform::cmd(bin).args(["pane", "list"]).output() else { return vec![] };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else { return vec![] };
     let self_pane = env_nonempty("HERDR_PANE_ID");
     v["result"]["panes"]
@@ -326,6 +332,7 @@ fn herdr_panes() -> Vec<PaneInfo> {
 }
 
 /// Claude Code codifica la ruta del proyecto sustituyendo todo lo no alfanumérico por '-'.
+/// En Windows `C:\Users\UR\Documents` → `C--Users-UR-Documents`.
 fn claude_encode(p: &Path) -> String {
     p.to_string_lossy()
         .chars()
@@ -333,14 +340,66 @@ fn claude_encode(p: &Path) -> String {
         .collect()
 }
 
+/// Normaliza una ruta para compararla: separadores unificados a `\`, sin duplicados (las
+/// transcripciones JSON escapan `\\`) y, en Windows, sin distinguir mayúsculas.
+fn norm_path(s: &str) -> String {
+    let s: Cow<'_, str> = if cfg!(windows) { Cow::Owned(s.to_lowercase()) } else { Cow::Borrowed(s) };
+    let mut out = String::with_capacity(s.len() + 1);
+    let mut after_sep = false;
+    for c in s.chars() {
+        if c == '/' || c == '\\' {
+            if !after_sep {
+                out.push('\\');
+            }
+            after_sep = true;
+        } else {
+            out.push(c);
+            after_sep = false;
+        }
+    }
+    out
+}
+
+/// `hay` empieza por `prefix` (sin distinguir mayúsculas en Windows).
+fn starts_with_ci(hay: &str, prefix: &str) -> bool {
+    match hay.get(..prefix.len()) {
+        Some(head) if cfg!(windows) => head.eq_ignore_ascii_case(prefix),
+        Some(head) => head == prefix,
+        None => false,
+    }
+}
+
+/// Texto donde buscar menciones (minúsculas en Windows, para comparar rutas sin caja).
+fn lower_text(s: &str) -> Cow<'_, str> {
+    if cfg!(windows) { Cow::Owned(s.to_lowercase()) } else { Cow::Borrowed(s) }
+}
+
+/// Variantes con las que una ruta puede aparecer en una transcripción: tal cual, con las
+/// barras escapadas de JSON (`\\`) y con `/`.
+fn path_needles(needle: &str) -> Vec<String> {
+    let mut out = vec![needle.to_string()];
+    #[cfg(windows)]
+    for alt in [needle.replace('\\', "\\\\"), needle.replace('\\', "/")] {
+        if !out.contains(&alt) {
+            out.push(alt);
+        }
+    }
+    out
+}
+
+/// Carácter que cierra una mención de ruta (en Windows `\` es separador, no final).
+fn is_mention_end(c: char) -> bool {
+    c == '"' || c == '\'' || c == '`' || c.is_whitespace() || c == ')' || (!cfg!(windows) && c == '\\')
+}
+
 /// Ficheros de sesión de agentes modificados desde `since` (Claude Code + Codex).
 fn session_files(start: &Path, since: i64) -> Vec<(PathBuf, i64)> {
     let mut files = Vec::new();
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return files };
+    let Some(home) = platform::home_dir() else { return files };
     let prefix = claude_encode(start);
     if let Ok(rd) = fs::read_dir(home.join(".claude/projects")) {
         for d in rd.flatten() {
-            if !d.file_name().to_string_lossy().starts_with(&prefix) {
+            if !starts_with_ci(&d.file_name().to_string_lossy(), &prefix) {
                 continue;
             }
             collect_recent(&d.path(), since, &mut files);
@@ -389,6 +448,9 @@ fn transcript_hits(start: &Path, repos: &[PathBuf], since: i64) -> HashMap<usize
 
 /// Repos mencionados (por ruta absoluta) en la cola de un fichero de sesión.
 fn repos_in_file(path: &Path, needle: &str, repos: &[PathBuf]) -> Vec<usize> {
+    if needle.is_empty() || repos.is_empty() {
+        return vec![];
+    }
     let Ok(mut f) = fs::File::open(path) else { return vec![] };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     if len > TAIL_BYTES {
@@ -399,27 +461,32 @@ fn repos_in_file(path: &Path, needle: &str, repos: &[PathBuf]) -> Vec<usize> {
         return vec![];
     }
     let text = String::from_utf8_lossy(&buf);
-    let repo_strs: Vec<String> = repos.iter().map(|r| r.to_string_lossy().into_owned()).collect();
+    let hay = lower_text(&text);
+    let needles = path_needles(&lower_text(needle));
+    let repo_strs: Vec<String> = repos.iter().map(|r| norm_path(&r.to_string_lossy())).collect();
     let mut found = vec![false; repos.len()];
-    for (pos, _) in text.match_indices(needle) {
-        if !is_tool_path(&text[..pos]) {
-            continue;
-        }
-        let rest = &text[pos..];
-        let end = rest
-            .find(|c: char| c == '"' || c == '\'' || c == '`' || c.is_whitespace() || c == '\\' || c == ')')
-            .unwrap_or(rest.len());
-        let mentioned = &rest[..end];
-        let best = repo_strs
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| {
-                mentioned.starts_with(r.as_str())
-                    && matches!(mentioned.as_bytes().get(r.len()), None | Some(b'/'))
-            })
-            .max_by_key(|(_, r)| r.len());
-        if let Some((i, _)) = best {
-            found[i] = true;
+    for needle in &needles {
+        let mut from = 0;
+        while let Some(hit) = hay[from..].find(needle.as_str()) {
+            let pos = from + hit;
+            from = pos + needle.len();
+            if !is_tool_path(&hay[..pos]) {
+                continue;
+            }
+            let rest = &hay[pos..];
+            let end = rest.find(is_mention_end).unwrap_or(rest.len());
+            let mentioned = norm_path(&rest[..end]);
+            let best = repo_strs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    mentioned.starts_with(r.as_str())
+                        && matches!(mentioned.as_bytes().get(r.len()), None | Some(b'\\'))
+                })
+                .max_by_key(|(_, r)| r.len());
+            if let Some((i, _)) = best {
+                found[i] = true;
+            }
         }
     }
     found.iter().enumerate().filter(|(_, f)| **f).map(|(i, _)| i).collect()
@@ -466,6 +533,41 @@ mod tests {
         );
     }
 
+    /// En Windows la ruta de `herdr pane list` llega como `C:\Users\...`.
+    #[cfg(windows)]
+    #[test]
+    fn encode_like_claude_windows() {
+        assert_eq!(
+            claude_encode(Path::new(r"C:\Users\UR\Documents")),
+            "C--Users-UR-Documents"
+        );
+        assert_eq!(
+            claude_encode(Path::new(r"C:\Users\UR\Documents\herdr-gitview")),
+            "C--Users-UR-Documents-herdr-gitview"
+        );
+    }
+
+    /// Rutas con barras escapadas (JSON), con `/` y con otra caja.
+    #[cfg(windows)]
+    #[test]
+    fn mentions_con_barras_escapadas_y_caja() {
+        let dir = std::env::temp_dir().join(format!("gv-disc-win-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("s.jsonl");
+        fs::write(
+            &f,
+            r#"{"file_path":"C:\\Users\\UR\\Documents\\repo\\src\\a.rs"} {"cwd":"C:/Users/UR/Documents/OTRO"} cd C:\Users\UR\Documents\suelto"#,
+        )
+        .unwrap();
+        let repos = vec![
+            PathBuf::from(r"C:\Users\UR\Documents\repo"),
+            PathBuf::from(r"C:\Users\UR\Documents\otro"),
+        ];
+        let got = repos_in_file(&f, r"C:\Users\UR\Documents", &repos);
+        assert_eq!(got, vec![0, 1]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn ymd_known_date() {
         let t = UNIX_EPOCH + Duration::from_secs(1_760_313_600); // 2025-10-13
@@ -501,7 +603,7 @@ mod tests {
         }
         let got: Vec<String> = find_repos(&base, 3)
             .iter()
-            .map(|p| p.strip_prefix(&base).unwrap().to_string_lossy().into_owned())
+            .map(|p| p.strip_prefix(&base).unwrap().to_string_lossy().replace('\\', "/"))
             .collect();
         assert_eq!(got, vec!["a", "b/c"]);
         fs::remove_dir_all(&base).ok();

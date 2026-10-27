@@ -25,11 +25,20 @@ fn remote_host(url: &str) -> Option<&str> {
     rest.split(':').next().filter(|host| !host.is_empty())
 }
 
-fn glab_config() -> Option<PathBuf> {
+fn glab_configs() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     if let Some(base) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Some(PathBuf::from(base).join("glab-cli/config.yml"));
+        paths.push(PathBuf::from(base).join("glab-cli/config.yml"));
     }
-    Some(PathBuf::from(std::env::var_os("HOME")?).join(".config/glab-cli/config.yml"))
+    if let Some(base) = std::env::var_os("APPDATA") {
+        paths.push(PathBuf::from(base).join("glab-cli/config.yml"));
+    }
+    for home in ["HOME", "USERPROFILE"] {
+        if let Some(base) = std::env::var_os(home) {
+            paths.push(PathBuf::from(base).join(".config/glab-cli/config.yml"));
+        }
+    }
+    paths
 }
 
 fn configured_hosts(config: &str) -> Vec<&str> {
@@ -64,14 +73,18 @@ pub fn is_gitlab(repo: &Path) -> bool {
     let Some(host) = remote_host(&url) else {
         return false;
     };
-    let Some(config) = glab_config().and_then(|path| fs::read_to_string(path).ok()) else {
-        return false;
-    };
-    configured_hosts(&config).contains(&host)
+    glab_configs().iter().filter_map(|path| fs::read_to_string(path).ok())
+        .any(|config| configured_hosts(&config).contains(&host))
 }
 
 fn api(repo: &Path, endpoint: &str) -> Result<Vec<u8>> {
-    let output = Command::new("glab")
+    let mut command = Command::new("glab");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .args(["api", endpoint])
         .current_dir(repo)
         .env("LC_ALL", "C")
@@ -87,7 +100,7 @@ fn api(repo: &Path, endpoint: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn parse_date(value: &str) -> Result<i64> {
+pub(crate) fn parse_date(value: &str) -> Result<i64> {
     if value.len() < 20 {
         bail!("fecha ISO8601 inválida: {value}");
     }

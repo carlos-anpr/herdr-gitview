@@ -1,5 +1,6 @@
 //! Configuración (~/.config/herdr-gitview/config.toml) con valores por defecto. PROPIETARIO: OpenCode.
 
+use crate::platform;
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -12,8 +13,8 @@ pub struct Config {
     pub ai_api_model: String,
     /// Campos extra (JSON) que se mezclan en el cuerpo de la petición.
     pub ai_api_extra: String,
-    /// Variable de entorno con la clave; si no está y hay `ai_api_auth_entry`, se lee esa entrada de
-    /// ~/.local/share/opencode/auth.json. Sin ninguna, la petición va sin clave (Ollama y similares).
+    /// Variable de entorno con la clave; por defecto `OLLAMA_API_KEY`. Si no está y hay
+    /// `ai_api_auth_entry`, se lee esa entrada de ~/.local/share/opencode/auth.json.
     pub ai_api_key_env: String,
     pub ai_api_auth_entry: String,
     /// argv del comando de IA; el prompt se pasa por stdin, la respuesta sale por stdout.
@@ -33,12 +34,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            // Sin proveedor por defecto: cada usuario configura el suyo.
             ai_backend: "api".into(),
-            ai_api_url: String::new(),
-            ai_api_model: String::new(),
-            ai_api_extra: String::new(),
-            ai_api_key_env: String::new(),
+            ai_api_url: "https://ollama.com/v1/chat/completions".into(),
+            ai_api_model: "minimax-m3.1-flash".into(),
+            // minimax razona mucho por defecto; con "low" responde ~10 veces antes con la misma calidad.
+            ai_api_extra: r#"{"reasoning_effort":"low"}"#.into(),
+            ai_api_key_env: "OLLAMA_API_KEY".into(),
             ai_api_auth_entry: String::new(),
             ai_command: Vec::new(),
             ai_max_diff_bytes: 60_000,
@@ -50,17 +51,9 @@ impl Default for Config {
     }
 }
 
-/// Ruta del fichero de configuración (`$XDG_CONFIG_HOME` o `~/.config`).
+/// Ruta del fichero de configuración (`$XDG_CONFIG_HOME` o `~/.config`, también en Windows).
 fn config_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
-        && !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("herdr-gitview").join("config.toml"));
-        }
-    let home = std::env::var_os("HOME")?;
-    if home.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(home).join(".config").join("herdr-gitview").join("config.toml"))
+    Some(platform::config_dir()?.join("herdr-gitview").join("config.toml"))
 }
 
 /// Carga config; si no existe o es inválida, usa defaults (nunca falla).
@@ -94,6 +87,10 @@ struct FileConfig {
 fn parse(text: &str) -> Result<Config, toml::de::Error> {
     let raw: FileConfig = toml::from_str(text)?;
     let mut cfg = Config::default();
+    // Los campos extra por defecto son para Ollama Cloud: no se envían a otro endpoint.
+    if raw.ai_api_url.is_some() && raw.ai_api_extra.is_none() {
+        cfg.ai_api_extra.clear();
+    }
     for (dst, src) in [
         (&mut cfg.ai_backend, raw.ai_backend),
         (&mut cfg.ai_api_url, raw.ai_api_url),
@@ -136,7 +133,10 @@ mod tests {
     fn defaults() {
         let cfg = Config::default();
         assert_eq!(cfg.ai_backend, "api");
-        assert!(cfg.ai_api_url.is_empty());
+        // Por defecto, Ollama Cloud (basta con exportar OLLAMA_API_KEY).
+        assert_eq!(cfg.ai_api_url, "https://ollama.com/v1/chat/completions");
+        assert_eq!(cfg.ai_api_model, "minimax-m3.1-flash");
+        assert_eq!(cfg.ai_api_key_env, "OLLAMA_API_KEY");
         assert!(cfg.ai_command.is_empty());
         assert_eq!(cfg.ai_max_diff_bytes, 60_000);
         assert_eq!(cfg.ai_timeout_secs, 120);
@@ -171,6 +171,21 @@ page_size = 7
         assert_eq!(cfg.scan_depth, 3);
         assert_eq!(cfg.ai_timeout_secs, 120);
         assert_eq!(cfg.ai_command, Config::default().ai_command);
+        assert_eq!(cfg.ai_api_url, "https://ollama.com/v1/chat/completions");
+        assert_eq!(cfg.ai_api_model, "minimax-m3.1-flash");
+        assert_eq!(cfg.ai_api_key_env, "OLLAMA_API_KEY");
+        assert_eq!(cfg.ai_api_extra, r#"{"reasoning_effort":"low"}"#);
+    }
+
+    #[test]
+    fn otro_endpoint_no_hereda_extra_de_ollama() {
+        let cfg = parse("ai_api_url = \"https://api.openai.com/v1/chat/completions\"
+").expect("toml válido");
+        assert!(cfg.ai_api_extra.is_empty());
+        let cfg = parse("ai_api_url = \"http://x\"
+ai_api_extra = '{\"a\":1}'
+").expect("toml válido");
+        assert_eq!(cfg.ai_api_extra, r#"{"a":1}"#);
     }
 
     #[test]

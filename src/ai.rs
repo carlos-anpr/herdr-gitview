@@ -2,10 +2,11 @@
 
 use crate::config::Config;
 use crate::model::*;
+use crate::platform;
 use anyhow::{bail, Context, Result};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -13,17 +14,10 @@ use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------- caché en disco
 
-/// `$XDG_CACHE_HOME/herdr-gitview/ai` o `~/.cache/herdr-gitview/ai`.
+/// `$XDG_CACHE_HOME/herdr-gitview/ai`, `%LOCALAPPDATA%\herdr-gitview\ai` en Windows o
+/// `~/.cache/herdr-gitview/ai`.
 fn default_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME")
-        && !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("herdr-gitview").join("ai"));
-        }
-    let home = std::env::var_os("HOME")?;
-    if home.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(home).join(".cache").join("herdr-gitview").join("ai"))
+    Some(platform::cache_dir()?.join("herdr-gitview").join("ai"))
 }
 
 /// FNV-1a de 64 bits.
@@ -182,7 +176,7 @@ fn run(cfg: &Config, prompt: &str) -> Result<String> {
     if argv.is_empty() {
         bail!("ai_command está vacío");
     }
-    let mut child = Command::new(&argv[0])
+    let mut child = platform::cmd(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -251,7 +245,7 @@ fn stream_lines(argv: &[String], input: Vec<u8>, timeout_secs: u64, on_line: &mu
     if argv.is_empty() {
         bail!("comando de IA vacío");
     }
-    let mut child = Command::new(&argv[0])
+    let mut child = platform::cmd(&argv[0])
         .args(&argv[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -276,7 +270,7 @@ fn stream_lines(argv: &[String], input: Vec<u8>, timeout_secs: u64, on_line: &mu
             while !done.load(Ordering::Relaxed) {
                 if Instant::now() >= deadline {
                     timed_out.store(true, Ordering::Relaxed);
-                    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+                    platform::kill_tree(pid);
                     return;
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -342,16 +336,31 @@ fn api_key(cfg: &Config) -> Result<Option<String>> {
         return Ok(Some(k.trim().to_owned()));
     }
     if cfg.ai_api_auth_entry.is_empty() {
-        return Ok(None);
+        if cfg.ai_api_key_env.is_empty() {
+            return Ok(None);
+        }
+        // Hay una variable configurada pero no está: es un error de configuración, no "sin clave".
+        bail!("{}", missing_key_msg(&cfg.ai_api_key_env));
     }
-    let home = std::env::var_os("HOME").context("sin HOME")?;
-    let path = PathBuf::from(home).join(".local/share/opencode/auth.json");
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("sin clave: define {} o inicia sesión en OpenCode", cfg.ai_api_key_env))?;
+    let home = platform::home_dir().context("sin HOME")?;
+    let path = home.join(".local/share/opencode/auth.json");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("{} o inicia sesión en OpenCode", missing_key_msg(&cfg.ai_api_key_env)))?;
     let v: serde_json::Value = serde_json::from_str(&raw).context("auth.json de OpenCode ilegible")?;
     v[&cfg.ai_api_auth_entry]["key"]
         .as_str()
         .map(|k| Some(k.to_owned()))
         .with_context(|| format!("auth.json no tiene clave para «{}»", cfg.ai_api_auth_entry))
+}
+
+/// Mensaje para una clave que falta (con el atajo de Ollama Cloud si es su variable).
+fn missing_key_msg(var: &str) -> String {
+    let hint = if var == "OLLAMA_API_KEY" {
+        " (clave de https://ollama.com/settings/keys)"
+    } else {
+        ""
+    };
+    format!("sin clave: define {var}{hint}")
 }
 
 /// Cuerpo JSON de chat/completions con streaming, mezclando `ai_api_extra`.
@@ -376,6 +385,7 @@ fn api_body(cfg: &Config, prompt: &str) -> Result<Vec<u8>> {
 }
 
 /// Extrae el texto de una línea SSE (`data: {...}`) de chat/completions.
+/// Ignora `delta.reasoning` (Ollama Cloud manda razonamiento antes del contenido).
 fn sse_delta(line: &str) -> Option<String> {
     let data = line.strip_prefix("data:")?.trim();
     if data == "[DONE]" {
@@ -383,6 +393,17 @@ fn sse_delta(line: &str) -> Option<String> {
     }
     let v: serde_json::Value = serde_json::from_str(data).ok()?;
     v["choices"][0]["delta"]["content"].as_str().map(str::to_owned)
+}
+
+/// Acumula el contenido de una línea SSE; `true` si aportó texto.
+fn sse_push(acc: &mut String, line: &str) -> bool {
+    match sse_delta(line) {
+        Some(t) => {
+            acc.push_str(&t);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Endpoint OpenAI-compatible vía `curl` (la clave va en un fichero de config 0600, no en argv).
@@ -393,8 +414,15 @@ fn run_api(cfg: &Config, prompt: &str, on_text: &mut dyn FnMut(&str)) -> Result<
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let conf = dir.join(format!(".curl-{}-{nanos}", std::process::id()));
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&conf)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Solo el dueño puede leer la clave (en Windows el fichero ya está en el perfil).
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&conf)?;
         if let Some(key) = &key {
             writeln!(f, "header = \"Authorization: Bearer {key}\"")?;
         }
@@ -403,7 +431,9 @@ fn run_api(cfg: &Config, prompt: &str, on_text: &mut dyn FnMut(&str)) -> Result<
         }
         writeln!(f, "header = \"Content-Type: application/json\"")?;
     }
-    let argv: Vec<String> = ["curl", "-sS", "-N", "--fail-with-body", "-K"]
+    // En Windows el binario se llama curl.exe (el `curl` del PATH puede ser un alias de PS).
+    let curl = if cfg!(windows) { "curl.exe" } else { "curl" };
+    let argv: Vec<String> = [curl, "-sS", "-N", "--fail-with-body", "-K"]
         .iter()
         .map(|s| s.to_string())
         .chain([conf.to_string_lossy().into_owned(), "--data-binary".into(), "@-".into(), cfg.ai_api_url.clone()])
@@ -412,8 +442,7 @@ fn run_api(cfg: &Config, prompt: &str, on_text: &mut dyn FnMut(&str)) -> Result<
     let mut raw = String::new();
     let res = api_body(cfg, prompt).and_then(|body| {
         stream_lines(&argv, body, cfg.ai_timeout_secs, &mut |line| {
-            if let Some(t) = sse_delta(line) {
-                text.push_str(&t);
+            if sse_push(&mut text, line) {
                 on_text(&text);
             } else if !line.starts_with("data:") && raw.len() < 2000 {
                 raw.push_str(line);
@@ -489,6 +518,22 @@ mod tests {
     }
 
     #[test]
+    fn stream_de_ollama_reasoning_y_luego_content() {
+        // Ollama Cloud manda primero `delta.reasoning` (se ignora) y después `delta.content`.
+        let mut acc = String::new();
+        for line in [
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"","reasoning":"pensando"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"","reasoning":" un poco más"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Ho"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"la"}}]}"#,
+            "data: [DONE]",
+        ] {
+            sse_push(&mut acc, line);
+        }
+        assert_eq!(acc, "Hola");
+    }
+
+    #[test]
     fn cuerpo_api_mezcla_extra() {
         let cfg = Config {
             ai_api_model: "modelo-x".into(),
@@ -501,6 +546,7 @@ mod tests {
         assert_eq!(v["messages"][1]["content"], "hola");
     }
 
+    #[cfg(unix)]
     #[test]
     fn stream_json_acumula_y_usa_result() {
         let script = r#"cat >/dev/null
@@ -518,6 +564,41 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         let out = run_stream(&cfg, "x", &mut |t| parts.push(t.to_string())).unwrap();
         assert_eq!(out, "Hola");
         assert_eq!(parts, ["Ho", "Hola"]);
+    }
+
+    /// En Windows, `cmd` no entiende las comillas escapadas (`\"`) de la línea de comandos:
+    /// se pasa la ruta entre comillas simples de PowerShell y el JSONL se vuelca con `Get-Content`.
+    #[cfg(windows)]
+    #[test]
+    fn stream_json_acumula_y_usa_result() {
+        let dir = temp_cache_dir("stream");
+        let script = dir.join("claude-stream.jsonl");
+        std::fs::write(
+            &script,
+            concat!(
+                "{\"type\":\"system\"}\n",
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Ho\"}}}\n",
+                "no json\n",
+                "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"la\"}}}\n",
+                "{\"type\":\"result\",\"is_error\":false,\"result\":\"Hola\"}",
+            ),
+        )
+        .unwrap();
+        let cfg = Config {
+            ai_command: vec![
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!("Get-Content -Raw -LiteralPath '{}'", script.display()),
+            ],
+            ai_timeout_secs: 20,
+            ..Config::default()
+        };
+        let mut parts = Vec::new();
+        let out = run_stream(&cfg, "x", &mut |t| parts.push(t.to_string())).unwrap();
+        assert_eq!(out, "Hola");
+        assert_eq!(parts, ["Ho", "Hola"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Dir de caché temporal para tests (se borra al final de cada test).
@@ -546,7 +627,8 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
 
     #[test]
     fn hash_estable() {
-        let dir = Path::new("/tmp");
+        let dir = std::env::temp_dir();
+        let dir = dir.as_path();
         let a = cache_file(dir, &req(AiKind::Commit, "commit:abc"));
         let b = cache_file(dir, &req(AiKind::Commit, "commit:abc"));
         assert_eq!(a, b);
@@ -586,7 +668,7 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         assert_eq!(omit3, 0);
 
         // UTF-8: nunca corta a mitad de un carácter
-        let largo: String = std::iter::repeat("áéíóúñ ").take(50).collect();
+        let largo: String = "áéíóúñ ".repeat(50);
         let (t4, omit4) = truncate_diff(&largo, 20);
         assert!(largo.get(..t4.len()).is_some());
         assert_eq!(t4.len() + omit4, largo.len());
@@ -630,7 +712,7 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         let linea = "linea de diff suficientemente larga\n"; // 35 bytes
         cfg.ai_max_diff_bytes = linea.len();
         let mut r = req(AiKind::Commit, "commit:big");
-        r.diff = std::iter::repeat(linea).take(20).collect();
+        r.diff = linea.repeat(20);
         let p = build_prompt(&cfg, &r);
         let dentro = p
             .split("```diff\n")
@@ -646,6 +728,7 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         assert!(p.contains(&nota), "falta la nota: {p}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn explain_ok_y_cache() {
         let dir = temp_cache_dir("ok");
@@ -666,6 +749,26 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn explain_ok_y_cache() {
+        let dir = temp_cache_dir("ok");
+        let cfg = Config {
+            ai_command: vec!["cmd".into(), "/C".into(), "echo hola".into()],
+            ..Config::default()
+        };
+        let r = req(AiKind::Commit, "commit:ok");
+        let out = explain_at(&cfg, &r, &dir).expect("explain debe funcionar");
+        assert_eq!(out, "hola");
+        assert!(cache_file(&dir, &r).exists(), "guarda en caché");
+        // segunda llamada: sale de caché aunque el comando ya no sirva
+        let mut roto = cfg.clone();
+        roto.ai_command = vec!["cmd".into(), "/C".into(), "exit 7".into()];
+        assert_eq!(explain_at(&roto, &r, &dir).unwrap(), "hola");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn explain_falla_por_timeout() {
         let dir = temp_cache_dir("timeout");
@@ -681,6 +784,26 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn explain_falla_por_timeout() {
+        let dir = temp_cache_dir("timeout");
+        // `ping` espera ~5 s sin depender de binarios extra.
+        let cfg = Config {
+            ai_command: vec!["cmd".into(), "/C".into(), "ping -n 6 127.0.0.1 >nul".into()],
+            ai_timeout_secs: 1,
+            ..Config::default()
+        };
+        let r = req(AiKind::Commit, "commit:timeout");
+        let t0 = Instant::now();
+        let err = explain_at(&cfg, &r, &dir).expect_err("debe fallar por timeout");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timeout"), "mensaje: {msg}");
+        assert!(t0.elapsed() < Duration::from_secs(4), "mató el proceso a tiempo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn explain_falla_con_rc_o_salida_vacia() {
         let dir = temp_cache_dir("rc");
@@ -696,6 +819,25 @@ echo '{"type":"result","is_error":false,"result":"Hola"}'"#;
         assert!(err.contains("boom"), "últimas líneas de stderr: {err}");
 
         cfg.ai_command = vec!["sh".into(), "-c".into(), "cat >/dev/null".into()];
+        let err = format!("{:#}", explain_at(&cfg, &r, &dir).expect_err("vacía"));
+        assert!(err.contains("vacía"), "mensaje: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explain_falla_con_rc_o_salida_vacia() {
+        let dir = temp_cache_dir("rc");
+        let mut cfg = Config {
+            ai_command: vec!["cmd".into(), "/C".into(), "echo boom 1>&2 & exit 3".into()],
+            ..Config::default()
+        };
+        let r = req(AiKind::Commit, "commit:rc");
+        let err = format!("{:#}", explain_at(&cfg, &r, &dir).expect_err("rc≠0"));
+        assert!(err.contains('3'), "mensaje: {err}");
+        assert!(err.contains("boom"), "últimas líneas de stderr: {err}");
+
+        cfg.ai_command = vec!["cmd".into(), "/C".into(), "rem sin salida".into()];
         let err = format!("{:#}", explain_at(&cfg, &r, &dir).expect_err("vacía"));
         assert!(err.contains("vacía"), "mensaje: {err}");
         let _ = std::fs::remove_dir_all(&dir);

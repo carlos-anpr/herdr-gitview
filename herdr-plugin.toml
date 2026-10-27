@@ -1,9 +1,9 @@
 id = "local.gitview"
 name = "gitview"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
-platforms = ["linux", "macos"]
-description = "Visor de commits, ramas y Merge Requests de GitLab estilo Git Graph, con explicaciones de IA."
+platforms = ["linux", "macos", "windows"]
+description = "Visor de commits, ramas, Pull Requests de GitHub y Merge Requests de GitLab estilo Git Graph, con explicaciones de IA."
 
 # Compila el binario al instalar (requiere cargo). Con `herdr plugin link .` compílalo tú: `cargo build --release`.
 [[build]]
@@ -13,13 +13,24 @@ command = ["cargo", "build", "--release", "--locked"]
 [[panes]]
 id = "viewer"
 title = "gitview"
+platforms = ["linux", "macos"]
 placement = "popup"
 width = "94%"
 height = "92%"
 command = ["sh", "-c", "exec \"${HERDR_PLUGIN_ROOT}/target/release/herdr-gitview\""]
 
+# En Windows no hay `sh`: el lanzador de paneles ejecuta el .exe directamente desde la carpeta del plugin.
+[[panes]]
+id = "viewer-windows"
+title = "gitview"
+platforms = ["windows"]
+placement = "popup"
+width = "94%"
+height = "92%"
+command = ["target/release/herdr-gitview.exe"]
+
 [[actions]]
 id = "open"
 title = "gitview: control de cambios del proyecto"
 contexts = ["pane", "workspace"]
-command = ["sh", "herdr/open.sh"]
+command = ["target/release/herdr-gitview", "--herdr-open"]

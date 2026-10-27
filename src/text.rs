@@ -47,11 +47,13 @@ pub fn status_color(c: char) -> Color {
     }
 }
 
-/// Desfase local en segundos (una vez, vía `date +%z`).
+/// Desfase local en segundos (una vez). Sin dependencias: `date +%z` en Unix y
+/// `GetTimeZoneInformation` de kernel32 en Windows.
+#[cfg(not(windows))]
 fn tz_offset() -> i64 {
     static OFF: OnceLock<i64> = OnceLock::new();
     *OFF.get_or_init(|| {
-        let out = std::process::Command::new("date").arg("+%z").output();
+        let out = crate::platform::cmd("date").arg("+%z").output();
         let s = out.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         if s.len() == 5 {
             let sign = if s.starts_with('-') { -1 } else { 1 };
@@ -62,6 +64,68 @@ fn tz_offset() -> i64 {
             0
         }
     })
+}
+
+/// Desfase local en segundos (una vez) vía `GetTimeZoneInformation`.
+#[cfg(windows)]
+fn tz_offset() -> i64 {
+    static OFF: OnceLock<i64> = OnceLock::new();
+    *OFF.get_or_init(win_tz::offset_secs)
+}
+
+#[cfg(windows)]
+mod win_tz {
+    /// `SYSTEMTIME` (8 campos de 16 bits).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+
+    /// `TIME_ZONE_INFORMATION` (`minwindef.h`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct TimeZoneInformation {
+        bias: i32,
+        standard_name: [u16; 32],
+        standard_date: SystemTime,
+        standard_bias: i32,
+        daylight_name: [u16; 32],
+        daylight_date: SystemTime,
+        daylight_bias: i32,
+    }
+
+    const TIME_ZONE_ID_INVALID: u32 = 0xffff_ffff;
+    const TIME_ZONE_ID_STANDARD: u32 = 1;
+    const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetTimeZoneInformation(info: *mut TimeZoneInformation) -> u32;
+    }
+
+    /// Offset local respecto a UTC en segundos: −(Bias + DaylightBias|StandardBias) minutos.
+    pub(super) fn offset_secs() -> i64 {
+        let mut info = TimeZoneInformation::default();
+        // SAFETY: `info` es un `TIME_ZONE_INFORMATION` válido y exclusivo.
+        let id = unsafe { GetTimeZoneInformation(&mut info) };
+        if id == TIME_ZONE_ID_INVALID {
+            return 0;
+        }
+        let extra = match id {
+            TIME_ZONE_ID_DAYLIGHT => info.daylight_bias,
+            TIME_ZONE_ID_STANDARD => info.standard_bias,
+            _ => 0, // TIME_ZONE_ID_UNKNOWN
+        };
+        -i64::from(info.bias + extra) * 60
+    }
 }
 
 pub fn civil(days: i64) -> (i64, u32, u32) {
@@ -266,5 +330,12 @@ mod tests {
     fn civil_epoch() {
         assert_eq!(civil(0), (1970, 1, 1));
         assert_eq!(civil(20374), (2025, 10, 13));
+    }
+
+    #[test]
+    fn tz_offset_en_minutos_y_rango_realista() {
+        let off = tz_offset();
+        assert_eq!(off % 60, 0, "el offset va en minutos exactos: {off}");
+        assert!(off.abs() <= 14 * 3600, "offset fuera de rango: {off}");
     }
 }

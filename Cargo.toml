@@ -1,9 +1,9 @@
 [package]
 name = "herdr-gitview"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
-description = "Visor de commits, diffs y Merge Requests de GitLab con explicaciones de IA, como plugin de herdr"
+description = "Visor de commits, diffs, Pull Requests de GitHub y Merge Requests de GitLab con explicaciones de IA, como plugin de herdr"
 
 [dependencies]
 anyhow = "1"
